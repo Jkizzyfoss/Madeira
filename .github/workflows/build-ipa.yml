@@ -23,9 +23,11 @@ on:
     paths:
       - '.github/workflows/build-ipa.yml'
 
+# Runs queue rather than cancel: a cancelled run throws away stages it already
+# built, and the stage cache is saved only when a run reaches its save step.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   # Xcode 16.4 is the default on macos-15 and carries the iOS 18 SDK; the app's
