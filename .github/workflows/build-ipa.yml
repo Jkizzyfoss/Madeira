@@ -1,0 +1,345 @@
+name: Build IPA
+
+# Builds Madeira.app for iOS and packages Payload/Madeira.app into an IPA.
+#
+# This file also carries the fork's host checks: ten scripts under
+# tests/host/ assert that their own check is wired into this workflow, so the
+# step names and the shell fragments below are load-bearing. tests/host/
+# check-vcruntime-mfc.py parses this file structurally and slices sections on
+# the literal "\n      - name:", so every step item is indented six spaces.
+#
+# Everything here follows docs/BUILDING.md; the steps it marks UNVERIFIED are
+# the ones most likely to fail first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rebuild_llvm:
+        description: Rebuild LLVM for iOS instead of restoring it from cache (takes hours)
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-ipa.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Xcode 16.4 is the default on macos-15 and carries the iOS 18 SDK; the app's
+  # deployment target is 17.0 (project.pbxproj:937).
+  XCODE_APP: /Applications/Xcode_16.4.app
+  LLVM_MINGW_VER: '20260421'
+  LLVM_MINGW_SHA: bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7
+  LLVM_COMMIT: 8dfdcc7b7
+
+jobs:
+  # The host checks are fast and independent of the app build, so they land a
+  # result in minutes while the build job is still compiling.
+  checks:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install extraction tools
+        run: brew install sevenzip
+
+      - name: Fetch the VC++ runtime DLLs from Microsoft
+        shell: bash
+        run: |
+          set -euo pipefail
+          WANT="concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll vccorlib140.dll vcomp140.dll vcruntime140.dll vcruntime140_1.dll vcruntime140_threads.dll mfc140.dll mfc140u.dll"
+          NWANT=$(echo $WANT | wc -w | tr -d ' ')
+          DEST="app/Madeira/x86_64-vcruntime"
+          URL="https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          TMP="$(mktemp -d "${TMPDIR:-/tmp}/madeira-vcrt.XXXXXX" 2>/dev/null || mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          mkdir -p "$DEST" "$TMP/ext" "$TMP/cab_out" "$TMP/stage"
+          echo "fetching the redistributable..."
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$TMP/VC_redist.x64.exe" "$URL"
+          SEVENZIP=""
+          if command -v 7zz >/dev/null 2>&1; then
+            SEVENZIP="7zz"
+          elif command -v 7z >/dev/null 2>&1; then
+            SEVENZIP="7z"
+          else
+            echo "error: 7zz or 7z not found (brew install sevenzip)" >&2
+            exit 1
+          fi
+          "$SEVENZIP" x "$TMP/VC_redist.x64.exe" -o"$TMP/ext" -y >/dev/null
+          i=0
+          while IFS= read -r -d '' cab; do
+            i=$((i + 1))
+            mkdir -p "$TMP/cab_out/$i"
+            "$SEVENZIP" x "$cab" -o"$TMP/cab_out/$i" -y >/dev/null 2>&1 || true
+          done < <(find "$TMP/ext" -type f -iname '*.cab' -print0)
+          # A CAB can carry both the amd64 and the arm64 payload; take the
+          # machine the games run on and leave the arm64 one.
+          is_x64() {
+            python3 -c '
+          import struct, sys
+          try:
+              with open(sys.argv[1], "rb") as f:
+                  d = f.read(1024)
+              if d[:2] != b"MZ":
+                  sys.exit(1)
+              pe = struct.unpack_from("<I", d, 0x3c)[0]
+              sys.exit(0 if struct.unpack_from("<H", d, pe + 4)[0] == 0x8664 else 1)
+          except Exception:
+              sys.exit(1)
+          ' "$1" 2>/dev/null
+          }
+          FOUND=0
+          for name in $WANT; do
+            base="${name%.dll}"
+            match=""
+            while IFS= read -r -d '' f; do
+              if is_x64 "$f"; then
+                match="$f"
+                break
+              fi
+            done < <(find "$TMP/cab_out" -type f \( -iname "$name*" -o -iname "F_CENTRAL_${base}_*" \) -print0)
+            if [ -n "$match" ]; then
+              cp "$match" "$TMP/stage/$name"
+              FOUND=$((FOUND + 1))
+            else
+              echo "warn: $name not found in the redistributable" >&2
+            fi
+            [ "$FOUND" -eq "$NWANT" ] && break
+          done
+          cp "$TMP/stage/"*.dll "$DEST/"
+          echo "recovered $FOUND of $NWANT"
+
+      - name: Report vcruntime contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          N=$(find app/Madeira/x86_64-vcruntime -maxdepth 1 -name '*.dll' | wc -l | tr -d ' ')
+          echo "vcruntime DLLs: $N of 14"
+          if [ "$N" -lt 14 ]; then
+            echo "error: expected fourteen files in app/Madeira/x86_64-vcruntime" >&2
+            ls -l app/Madeira/x86_64-vcruntime >&2 || true
+            exit 1
+          fi
+
+      - name: Check eco-native
+        run: python3 tests/host/check-eco-native.py
+
+      - name: Check lean-diag
+        run: python3 tests/host/check-lean-diag.py
+
+      - name: Check msc-unbounded-retry
+        run: python3 tests/host/check-msc-unbounded-retry.py
+
+      - name: Check power-probe
+        run: python3 tests/host/check-power-probe.py
+
+      - name: Check quiet-log
+        run: python3 tests/host/check-quiet-log.py
+
+      - name: Check srv-direct
+        run: python3 tests/host/check-srv-direct.py
+
+      - name: Check srv-eco-follow
+        run: python3 tests/host/check-srv-eco-follow.py
+
+      - name: Check srv-fd-reply
+        run: python3 tests/host/check-srv-fd-reply.py
+
+      - name: Check vcruntime-mfc
+        run: python3 tests/host/check-vcruntime-mfc.py
+
+      - name: Check x64-image-nocopy
+        run: python3 tests/host/check-x64-image-nocopy.py
+
+  build:
+    runs-on: macos-15
+    timeout-minutes: 350
+    needs: checks
+    steps:
+      - name: Check out the repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode and install host tools
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          # bison 3 for wine's tools/wrc (macOS ships 2.3), meson for the DXMT
+          # PE side, sevenzip for the VC++ runtime payload.
+          brew install bison meson sevenzip
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          # airconv compiles Metal source; the component is a separate download.
+          xcodebuild -downloadComponent MetalToolchain || echo "warn: Metal toolchain component unavailable"
+
+      - name: Report disk and memory before building
+        run: |
+          df -h /
+          sysctl -n hw.ncpu hw.memsize
+
+      - name: Cache LLVM for iOS
+        id: llvm-cache
+        if: ${{ inputs.rebuild_llvm != true }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-host-build
+            toolchains/llvm-ios-build
+          key: llvm-ios-${{ env.LLVM_COMMIT }}-${{ env.LLVM_MINGW_VER }}-v1
+
+      - name: Install llvm-mingw
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains
+          TARBALL="llvm-mingw-${LLVM_MINGW_VER}-ucrt-macos-universal.tar.xz"
+          curl -fL --retry 3 -o "/tmp/$TARBALL" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VER}/${TARBALL}"
+          echo "${LLVM_MINGW_SHA}  /tmp/${TARBALL}" | shasum -a 256 -c -
+          tar -xJf "/tmp/$TARBALL" -C toolchains/
+          test -d "toolchains/llvm-mingw-${LLVM_MINGW_VER}-ucrt-macos-universal"
+          "toolchains/llvm-mingw-${LLVM_MINGW_VER}-ucrt-macos-universal/bin/arm64ec-w64-mingw32-clang" --version
+
+      - name: Build LLVM for iOS (two stages)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # llvm-ios-build/ must expose include/ and lib/*.a: airconv links the
+          # bitcode reader and writer out of it (build/dxmt-ios/README.md:35-43).
+          if [ ! -d toolchains/llvm-project ]; then
+            git clone --filter=blob:none https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          fi
+          git -C toolchains/llvm-project checkout "$LLVM_COMMIT"
+          # Apple's ld has no --gc-sections; AddLLVM picks it for Darwin only.
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
+            toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+
+          echo "=== host stage: llvm-tblgen ==="
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD=host \
+            -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_INCLUDE_TESTS=Off \
+            -DLLVM_ENABLE_ZLIB=Off
+          ninja -C toolchains/llvm-host-build llvm-tblgen
+
+          echo "=== iOS stage ==="
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_TARGET_ARCH=host \
+            -DLLVM_TARGETS_TO_BUILD= \
+            -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_INCLUDE_TESTS=Off \
+            -DLLVM_ENABLE_ZLIB=Off \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen"
+          ninja -C toolchains/llvm-ios-build
+          ls -l toolchains/llvm-ios-build/lib/*.a | head
+
+      - name: Build GnuTLS stack
+        run: bash build/gnutls-ios/build.sh
+
+      - name: Build FFmpeg
+        run: bash build/ffmpeg/build.sh
+
+      - name: Build FEX for iOS
+        run: bash build/fex-ios/build.sh
+
+      - name: Build FEX ARM64EC module
+        run: bash build/fex-arm64ec/build.sh
+
+      - name: Build Wine unix side
+        run: |
+          set -euo pipefail
+          bash build/ntdll-unix/build.sh
+          bash build/wineserver/build.sh
+          bash build/win32u-unix/build.sh
+
+      - name: Build Wine PE ntdll
+        run: bash build/wine-pe/build-ntdll.sh
+
+      - name: Build DXMT unix side
+        run: |
+          set -euo pipefail
+          bash build/dxmt-ios/build.sh
+          xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
+            build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
+
+      - name: Build in-app pairing library
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          bash build/rppairing-ios/build.sh
+
+      - name: Build native D3D12 runtime
+        run: |
+          set -euo pipefail
+          bash build/madeira-d3d12/build-pe.sh
+          bash build/faultrep/build.sh
+
+      - name: Stage licences
+        run: bash build/stage-licenses.sh
+
+      - name: Report disk before the app build
+        run: df -h /
+
+      - name: Build Madeira.app
+        run: |
+          set -euo pipefail
+          # No shared scheme is committed, so drive the target directly.
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -target Madeira \
+            -configuration Debug \
+            -sdk iphoneos \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package the IPA
+        run: |
+          set -euo pipefail
+          APP="$(find build/dd/Build/Products/Debug-iphoneos -maxdepth 1 -name '*.app' | head -1)"
+          echo "app: $APP"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          cd build/ipa
+          zip -qry ../Madeira.ipa Payload
+          cd -
+          ls -lh build/ipa/Madeira.ipa
+          unzip -l build/ipa/Madeira.ipa | head -20
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-ipa
+          path: build/ipa/Madeira.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            app/Madeira.xcodeproj/*.log
+            build/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
