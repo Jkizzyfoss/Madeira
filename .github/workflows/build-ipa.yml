@@ -253,6 +253,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD= \
             -DLLVM_ENABLE_PROJECTS= \
             -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_BUILD_UTILS=Off \
             -DLLVM_INCLUDE_TESTS=Off \
             -DLLVM_ENABLE_ZLIB=Off \
             -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen"
