@@ -78,7 +78,9 @@ jobs:
           grep -boa "MSCF" "$TMP/VC_redist.x64.exe" | cut -d: -f1 | while IFS= read -r off; do
             size=$(od -An -tu4 -j $((off + 8)) -N 4 "$TMP/VC_redist.x64.exe" | tr -d ' ')
             [ -n "$size" ] && [ "$size" -gt 0 ] || continue
-            tail -c +$((off + 1)) "$TMP/VC_redist.x64.exe" | head -c "$size" > "$TMP/cabs/cab$off.cab"
+            # tail never sees SIGPIPE from head here: write, then cut to length.
+            tail -c +$((off + 1)) "$TMP/VC_redist.x64.exe" > "$TMP/cabs/cab$off.cab"
+            truncate -s "$size" "$TMP/cabs/cab$off.cab"
           done
           for f in "$TMP/cabs"/*; do
             [ -f "$f" ] || continue
@@ -87,14 +89,14 @@ jobs:
           for dir in "$TMP"/l0_*; do
             [ -d "$dir" ] || continue
             for f in "$dir"/*; do
-              [ "$(head -c 4 "$f" 2>/dev/null)" = "MSCF" ] || continue
+              [ "$(head -c 4 "$f" 2>/dev/null | tr -d '\0')" = "MSCF" ] || continue
               "$SEVENZIP" x "$f" -o"$TMP/l1_$(basename "$f" .cab)" -y >/dev/null 2>&1 || true
             done
           done
           for dir in "$TMP"/l1_*; do
             [ -d "$dir" ] || continue
             for f in "$dir"/*; do
-              [ "$(head -c 4 "$f" 2>/dev/null)" = "MSCF" ] || continue
+              [ "$(head -c 4 "$f" 2>/dev/null | tr -d '\0')" = "MSCF" ] || continue
               "$SEVENZIP" x "$f" -o"$TMP/l2_$(basename "$f" .cab)" -y >/dev/null 2>&1 || true
             done
           done
