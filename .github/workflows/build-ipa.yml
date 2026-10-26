@@ -58,7 +58,7 @@ jobs:
           URL="https://aka.ms/vs/17/release/vc_redist.x64.exe"
           TMP="$(mktemp -d "${TMPDIR:-/tmp}/madeira-vcrt.XXXXXX" 2>/dev/null || mktemp -d)"
           trap 'rm -rf "$TMP"' EXIT
-          mkdir -p "$DEST" "$TMP/ext" "$TMP/cab_out" "$TMP/stage"
+          mkdir -p "$DEST" "$TMP/stage" "$TMP/cabs"
           echo "fetching the redistributable..."
           curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$TMP/VC_redist.x64.exe" "$URL"
           SEVENZIP=""
@@ -70,29 +70,37 @@ jobs:
             echo "error: 7zz or 7z not found (brew install sevenzip)" >&2
             exit 1
           fi
-          "$SEVENZIP" x "$TMP/VC_redist.x64.exe" -o"$TMP/ext" -y >/dev/null
-          i=0
-          while IFS= read -r -d '' cab; do
-            i=$((i + 1))
-            mkdir -p "$TMP/cab_out/$i"
-            "$SEVENZIP" x "$cab" -o"$TMP/cab_out/$i" -y >/dev/null 2>&1 || true
-          done < <(find "$TMP/ext" -type f -iname '*.cab' -print0)
+          # The redistributable is a Burn bundle: one CAB is appended after the
+          # bootstrapper's own archive, and that payload CAB holds further CABs
+          # (one for the C++ runtime, one for MFC). 7-Zip only unpacks the
+          # bootstrapper, so carve every embedded MSCF blob by the cbCabinet
+          # length in its header, then unpack whatever cabinets fall out.
+          grep -boa "MSCF" "$TMP/VC_redist.x64.exe" | cut -d: -f1 | while IFS= read -r off; do
+            size=$(od -An -tu4 -j $((off + 8)) -N 4 "$TMP/VC_redist.x64.exe" | tr -d ' ')
+            [ -n "$size" ] && [ "$size" -gt 0 ] || continue
+            tail -c +$((off + 1)) "$TMP/VC_redist.x64.exe" | head -c "$size" > "$TMP/cabs/cab$off.cab"
+          done
+          for f in "$TMP/cabs"/*; do
+            [ -f "$f" ] || continue
+            "$SEVENZIP" x "$f" -o"$TMP/l0_$(basename "$f" .cab)" -y >/dev/null 2>&1 || true
+          done
+          for dir in "$TMP"/l0_*; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+              [ "$(head -c 4 "$f" 2>/dev/null)" = "MSCF" ] || continue
+              "$SEVENZIP" x "$f" -o"$TMP/l1_$(basename "$f" .cab)" -y >/dev/null 2>&1 || true
+            done
+          done
+          for dir in "$TMP"/l1_*; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+              [ "$(head -c 4 "$f" 2>/dev/null)" = "MSCF" ] || continue
+              "$SEVENZIP" x "$f" -o"$TMP/l2_$(basename "$f" .cab)" -y >/dev/null 2>&1 || true
+            done
+          done
           # A CAB can carry both the amd64 and the arm64 payload; take the
           # machine the games run on and leave the arm64 one.
-          is_x64() {
-            python3 -c '
-          import struct, sys
-          try:
-              with open(sys.argv[1], "rb") as f:
-                  d = f.read(1024)
-              if d[:2] != b"MZ":
-                  sys.exit(1)
-              pe = struct.unpack_from("<I", d, 0x3c)[0]
-              sys.exit(0 if struct.unpack_from("<H", d, pe + 4)[0] == 0x8664 else 1)
-          except Exception:
-              sys.exit(1)
-          ' "$1" 2>/dev/null
-          }
+          is_x64() { python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(1024); sys.exit(0 if d[:2]==b"MZ" and struct.unpack_from("<H", d, struct.unpack_from("<I", d, 0x3c)[0] + 4)[0] == 0x8664 else 1)' "$1" 2>/dev/null; }
           FOUND=0
           for name in $WANT; do
             base="${name%.dll}"
@@ -102,7 +110,7 @@ jobs:
                 match="$f"
                 break
               fi
-            done < <(find "$TMP/cab_out" -type f \( -iname "$name*" -o -iname "F_CENTRAL_${base}_*" \) -print0)
+            done < <(find "$TMP" -type f \( -iname "$name*" -o -iname "F_CENTRAL_${base}_*" \) -print0)
             if [ -n "$match" ]; then
               cp "$match" "$TMP/stage/$name"
               FOUND=$((FOUND + 1))
